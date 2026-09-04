@@ -1,5 +1,7 @@
 # GLM53-BLACKWELL
 
+![GLM-5.3-Flash on RTX 5090](social-preview.png)
+
 Verified GLM-5.3-Flash serving recipes for consumer Blackwell (RTX 5090,
 sm120), with the llama.cpp fixes that made it usable. Every number here was
 measured on real machines with the exact commands and patches published next
