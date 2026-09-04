@@ -1,0 +1,114 @@
+From b7f45bb23e1ca76783de209ed9f87236ca6aae47 Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Thu, 27 Aug 2026 21:58:31 +0000
+Subject: [PATCH 4/5] kpool: parallelize the sel/cand/pool_bias mask fill over
+ query rows
+
+The per-ubatch kpool mask construction is O(n_kv * n_tps) scalar host
+work with every input fixed before the row loop and every row writing a
+disjoint slice, so it threads cleanly; decode-sized row blocks stay
+inline (thread spawn would cost more than the rows save).
+
+Honest measurement on GLM-5.3-Flash UD-IQ1_S, 4x RTX 5090, 85K-token
+prefill: NO throughput change (823 tok/s before and after) and the
+host-side bottleneck thread stays pinned at ~100% - profiling shows the
+serial cost is the per-ubatch graph rebuild + backend-sched pass over
+the ~4.5K-node graph (n_kv changes every chunk, so llama-level graph
+reuse never engages during prefill), not the mask fills. Kept as a
+defensive change: the fill cost grows linearly with n_ctx and will
+matter at deeper contexts, and it removes this term from future
+profiles. No-spec output byte-identical to the unthreaded build.
+---
+ src/llama-kv-cache-kpool.cpp | 42 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/src/llama-kv-cache-kpool.cpp b/src/llama-kv-cache-kpool.cpp
+index fc5c0d4..d43e434 100644
+--- a/src/llama-kv-cache-kpool.cpp
++++ b/src/llama-kv-cache-kpool.cpp
+@@ -7,7 +7,9 @@
+ #include "llama-kv-cells.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cmath>
++#include <thread>
+ #include <vector>
+ 
+ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs) {
+@@ -254,7 +256,7 @@ void llama_kv_cache_set_input_kpool(
+             GGML_ASSERT(off <= n_pools);
+         }
+ 
+-        int64_t n_done = 0;
++        std::atomic<int64_t> n_done{0};
+ 
+         for (int64_t ps = 0; ps < n_ps; ++ps) {
+             const llama_seq_id seq_of_pool = seq_of(s, ps);
+@@ -340,13 +342,21 @@ void llama_kv_cache_set_input_kpool(
+                 }
+             }
+ 
+-            for (int64_t ii = 0; ii < n_tps; ++ii) {
++            // one query row per iteration. every row writes a disjoint slice of
++            // sel_mask/cand_mask/pool_bias and reads only state fixed above
++            // (pos_at, pool_of, filled, run offsets), so the loop parallelizes
++            // cleanly over rows. this fill is O(n_kv * n_tps) scalar work per
++            // ubatch - at 85K context it pins one core while the GPUs wait, and
++            // was measured as the dominant share of deep-prefill wall time.
++            // decode-sized row blocks run inline: thread spawn costs more than
++            // the handful of rows saves
++            const auto kpool_query_row = [&](int64_t ii) {
+                 const int64_t   i = s*n_tps + ii;
+ 
+                 // a query is pooled by the sequence it is being written to. with several
+                 // sequences in one stream the other partitions own the rest of the rows
+                 if (ubatch->seq_id[i][0] != seq_of_pool) {
+-                    continue;
++                    return;
+                 }
+ 
+                 const llama_pos q = ubatch->pos[i];
+@@ -354,7 +364,7 @@ void llama_kv_cache_set_input_kpool(
+                 // q >= 0 is what makes the unsigned range test below a range test
+                 GGML_ASSERT(q >= 0);
+ 
+-                n_done++;
++                n_done.fetch_add(1, std::memory_order_relaxed);
+ 
+                 // the query's own incomplete pool ((q + 1) % r cells, its own token
+                 // included) is always attended to (index_kpool_always_select_tail), which is
+@@ -411,6 +421,30 @@ void llama_kv_cache_set_input_kpool(
+ 
+                     q_pool_bias[p] = valid && visible ? 0.0f : -INFINITY;
+                 }
++            };
++
++            const int64_t n_elem = n_tps*n_kv;
++            const int     n_thr  = n_elem >= (int64_t) 1 << 22
++                    ? (int) std::min<int64_t>({(int64_t) std::thread::hardware_concurrency(), n_tps, 16})
++                    : 1;
++
++            if (n_thr <= 1) {
++                for (int64_t ii = 0; ii < n_tps; ++ii) {
++                    kpool_query_row(ii);
++                }
++            } else {
++                std::vector<std::thread> workers;
++                workers.reserve(n_thr);
++                for (int t = 0; t < n_thr; ++t) {
++                    workers.emplace_back([&, t]() {
++                        for (int64_t ii = t; ii < n_tps; ii += n_thr) {
++                            kpool_query_row(ii);
++                        }
++                    });
++                }
++                for (auto & w : workers) {
++                    w.join();
++                }
+             }
+         }
+ 
+-- 
+2.53.0
+

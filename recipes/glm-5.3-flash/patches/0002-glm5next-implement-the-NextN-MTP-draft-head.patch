@@ -1,0 +1,244 @@
+From 3dcb272195f82896ea100d4d9d8f37177fefd46a Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Thu, 27 Aug 2026 20:28:32 +0000
+Subject: [PATCH 2/5] glm5next: implement the NextN/MTP draft head
+
+Port the glm_dsa graph_mtp pattern to glm5next so --spec-type draft-mtp
+works. The NextN block (blk.45) is dense MLA + MoE with a plain residual:
+no KDA, no mHC mixer, and the DSA indexer is unused at runtime, so the
+head reuses build_dsa_layer with inp_kp == nullptr (the dense path) and
+build_layer_ffn via a context-only graph ctor. NoPE means none of
+glm_dsa's rope/YaRN kq_scale replication applies.
+
+- create_memory: route glm5next MTP contexts past the hybrid wrapper to
+  the plain filtered attention cache (il >= n_layer), like qwen35/qwen3next
+- trunk: export t_h_nextn (post output_norm) with the same masked/unmasked
+  embeddings_nextn row handling as glm_dsa
+- graph_mtp: enorm/hnorm -> eh_proj -> dense decoder block ->
+  shared_head_norm -> shared LM head
+
+Measured on GLM-5.3-Flash UD-IQ1_S, 4x RTX 5090 (sm120), 262,144 ctx,
+greedy, --spec-draft-n-max 4: draft acceptance 0.90-0.98, mean accepted
+length 4.6-4.9; decode 81 -> 136 tok/s shallow, 19.7 -> 56.8 tok/s at
+86K depth. n-max 6 helps only copy-heavy depth workloads (68.9 tok/s
+at 86K) and hurts fresh generation; 4 is the all-round default.
+No-spec output is byte-identical to the pre-change build.
+---
+ src/llama-model.cpp     |   4 +-
+ src/models/glm5next.cpp | 136 ++++++++++++++++++++++++++++++++++++++--
+ src/models/models.h     |  12 ++++
+ 3 files changed, 147 insertions(+), 5 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 0d1bfee..6927a6d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2411,10 +2411,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+         default:
+             {
+                 // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
++                // glm5next's NextN block is dense MLA (no KDA, indexer unused at runtime,
++                // as in glm_dsa), so its MTP context takes the same plain filtered cache.
+                 const bool mtp_on_hybrid_qwen =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+-                     arch == LLM_ARCH_BAILINGMOE3);
++                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_GLM5NEXT);
+ 
+                 const bool mtp_on_hybrid_nemotron =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+diff --git a/src/models/glm5next.cpp b/src/models/glm5next.cpp
+index 2cb8d4c..adf38c3 100644
+--- a/src/models/glm5next.cpp
++++ b/src/models/glm5next.cpp
+@@ -843,7 +843,10 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
+         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+     }
+ 
+-    if (inp_out_ids) {
++    // when unmasked nextn embeddings are requested, t_h_nextn must keep all rows,
++    // so the early output masking has to be skipped (it is applied after the final
++    // norm instead), as in glm_dsa
++    if (inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+         // flattened: get_rows needs one token's streams to be one contiguous row
+         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
+         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
+@@ -855,6 +858,16 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
+ 
+     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+     cb(cur, "result_norm", -1);
++
++    if (cparams.embeddings_nextn) {
++        // post-norm hidden state feeds the NextN/MTP draft head, as in glm_dsa
++        cb(cur, "h_nextn", -1);
++        res->t_h_nextn = cur;
++
++        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++    }
+     res->t_embd = cur;
+ 
+     cur = ggml_mul_mat(ctx0, model.output, cur);
+@@ -864,10 +877,125 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
+     ggml_build_forward_expand(gf, cur);
+ }
+ 
++// LLM_GRAPH_TYPE_DECODER_MTP draft head for GLM-5.3-Flash (GLM5NEXT).
++// Semantics mirror the deepseek-family NextN/MTP layer, as in glm_dsa:
++//   enorm(embed) + hnorm(prev_hidden) -> concat(e, h) -> eh_proj ->
++//   one full glm5next decoder block -> shared_head_norm (fallback output_norm)
++//   -> shared LM head.
++// The NextN block is dense MLA: no KDA, no mHC mixer (plain residual), and the
++// DSA indexer is not used at runtime - build_dsa_layer with inp_kp == nullptr is
++// exactly the dense path. create_memory() routes the MTP context past the hybrid
++// wrapper to a plain K-only cache filtered to il >= n_layer(), which is what
++// build_attn_inp_k() expects. NoPE throughout, so unlike glm_dsa there is no
++// rope and no YaRN kq_scale pre-scaling to replicate.
++llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
++    : graph(params) {
++    GGML_ASSERT(hparams.n_layer_nextn == 1 && "glm5next MTP currently only supports a single NextN block");
++
++    const int il = hparams.n_layer() + cparams.nextn_layer_offset;
++    GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
++                cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
++                "nextn_layer_offset out of range [0, n_layer_nextn)");
++    const auto & layer = model.layers[il];
++
++    GGML_ASSERT(layer.nextn.eh_proj && "MTP block missing nextn.eh_proj");
++    GGML_ASSERT(layer.nextn.enorm   && "MTP block missing nextn.enorm");
++    GGML_ASSERT(layer.nextn.hnorm   && "MTP block missing nextn.hnorm");
++    GGML_ASSERT(layer.ffn_gate_inp  && "MTP block missing ffn_gate_inp");
++
++    // TODO: extract in a common llm_graph_context::build_inp_embd_h() (same
++    // boilerplate as glm_dsa/deepseek4)
++    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
++
++    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++    ggml_set_input(inp->tokens);
++
++    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
++    ggml_set_input(inp->embd);
++
++    ggml_tensor * tok_embd;
++    if (ubatch.token) {
++        ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
++
++        tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
++    } else {
++        tok_embd = inp->embd;
++    }
++    cb(tok_embd, "mtp_tok_embd", il);
++
++    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
++    ggml_set_input(inp->h);
++    ggml_set_name(inp->h, "mtp_h_input");
++
++    ggml_tensor * h_embd = inp->h;
++
++    res->add_input(std::move(inp));
++
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    auto * inp_attn = build_attn_inp_k();
++
++    ggml_tensor * h_norm = build_norm(h_embd, layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
++    cb(h_norm, "mtp_hnorm", il);
++
++    ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
++    cb(e_norm, "mtp_enorm", il);
++
++    ggml_tensor * concat = ggml_concat(ctx0, e_norm, h_norm, /*dim=*/ 0);
++    cb(concat, "mtp_concat", il);
++
++    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
++    cb(cur, "mtp_eh_proj", il);
++
++    // plain residual: the NextN block has no mHC mixer
++    ggml_tensor * inpSA = cur;
++
++    cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++    cb(cur, "mtp_attn_norm", il);
++
++    cur = build_dsa_layer(layer, inp_attn, /*inp_kp=*/ nullptr, /*scoring=*/ false, cur, il);
++    cb(cur, "mtp_attn_out", il);
++
++    ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++    cb(ffn_inp, "mtp_ffn_inp", il);
++
++    cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++    cb(cur, "mtp_ffn_norm", il);
++
++    cur = build_layer_ffn(model, cur, il);
++    cb(cur, "mtp_ffn_out", il);
++
++    cur = ggml_add(ctx0, cur, ffn_inp);
++    cb(cur, "mtp_post_ffn", il);
++
++    // shared_head_norm applied after the decoder block, before the shared LM head.
++    // The post-norm hidden state seeds the next MTP step.
++    ggml_tensor * head_norm_w = layer.nextn.shared_head_norm
++            ? layer.nextn.shared_head_norm
++            : model.output_norm;
++    GGML_ASSERT(head_norm_w && "glm5next MTP: missing both nextn.shared_head_norm and output_norm");
++    cur = build_norm(cur, head_norm_w, nullptr, LLM_NORM_RMS, -1);
++
++    cb(cur, "h_nextn", -1);
++    res->t_h_nextn = cur;
++
++    cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++    cb(cur, "mtp_shared_head_norm", -1);
++
++    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
++    ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
++    GGML_ASSERT(head_w && "glm5next MTP: missing LM head (nextn.shared_head_head or model.output)");
++    cur = build_lora_mm(head_w, cur, head_s);
++    cb(cur, "result_output", -1);
++
++    res->t_logits = cur;
++    ggml_build_forward_expand(gf, cur);
++}
++
+ std::unique_ptr<llm_graph_context> llama_model_glm5next::build_arch_graph(const llm_graph_params & params) const {
+-    // llama_init_from_model accepts an MTP context whenever n_layer_nextn > 0,
+-    // which every glm5next checkpoint has; without this it silently runs the trunk
+-    GGML_ASSERT(params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && "glm5next NextN graph not implemented yet");
++    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
++        return std::make_unique<graph_mtp>(*this, params);
++    }
+ 
+     return std::make_unique<graph>(*this, params);
+ }
+diff --git a/src/models/models.h b/src/models/models.h
+index 1182fd7..c3845b5 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1351,6 +1351,10 @@ struct llama_model_glm5next : public llama_model_base {
+     struct graph : public llama_model_deepseek4::graph {
+         graph(const llama_model & model, const llm_graph_params & params);
+ 
++        // context-only: builds nothing. graph_mtp delegates here so it can reuse
++        // build_dsa_layer/build_layer_ffn without building the trunk
++        graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
++
+         // not const: the delta-net helpers append to the graph through the base
+         ggml_tensor * build_layer_attn(
+                 const llama_model & model,
+@@ -1397,6 +1401,14 @@ struct llama_model_glm5next : public llama_model_base {
+                 int il) const;
+     };
+ 
++    // NextN/MTP draft head: enorm/hnorm -> eh_proj -> one dense-MLA decoder block
++    // (build_dsa_layer without the indexer, plain residual - the NextN block has no
++    // mHC mixer) -> shared_head_norm -> shared LM head. Derives from graph for the
++    // layer builders; the context-only ctor keeps the trunk out of it
++    struct graph_mtp : public graph {
++        graph_mtp(const llama_model & model, const llm_graph_params & params);
++    };
++
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
+-- 
+2.53.0
+

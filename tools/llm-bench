@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""llm-bench — serving perf suite for the rig's OpenAI-compatible endpoints.
+
+Measures, per request: TTFT, prefill tok/s (unique large prompts only), decode
+tok/s (first->last token interval), spec-decode acceptance per drafted token
+(/metrics counter deltas), and prefix-cache hits (usage.prompt_tokens_details).
+Stdlib only. Defaults reproduce the 2026-08-26 Qwen3.8 methodology (CLAUDE.md
+"vLLM v0.28.0 ... DEPLOYED" + "DFlash2 revisited" sections), so new numbers are
+comparable with those tables.
+
+Suites:
+  story      2 greedy 800-tok generations, ~400-tok prompts (spec-decode WORST case)
+  code       fresh code-gen + copy-heavy refactor (spec-decode best case, = pi traffic)
+  depth      one unique ~--depth-tokens story prompt: real prefill + decode at depth
+  codedepth  one unique ~--depth-tokens code file + rewrite task
+  cache-probe  send A then A+suffix; reports cached_tokens vs max possible block hit
+               (detects the EAGLE-family last-block drop, vllm#53670)
+  stress     --concurrency N parallel code-gen streams (sm120 spec-decode SIGSEGV
+             class needs n>=4 to trigger; checks /health after)
+
+Protocol discipline baked in: a warmup request runs first and is discarded
+(cold-start is ~5x off); prompts are seeded so runs are IDENTICAL across server
+variants (compare run-by-run, not averages — acceptance varies with generated
+content); repeating a suite against the SAME live server hits the prefix cache,
+so pass a fresh --salt to re-measure prefill honestly.
+
+Examples:
+  llm-bench story code                          # production (:8014), quick compare
+  llm-bench --base http://127.0.0.1:8031 depth codedepth --depth-tokens 150000
+  llm-bench stress --concurrency 8 --runs 3     # crash hunt before trusting a drafter
+"""
+import argparse
+import json
+import random
+import sys
+import threading
+import time
+import os
+import urllib.request
+
+API_KEY = os.environ.get("LLMBENCH_API_KEY") or os.environ.get("VLLM_API_KEY") or ""
+
+
+def _auth(h):
+    if API_KEY:
+        h["Authorization"] = "Bearer " + API_KEY
+    return h
+
+WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima "
+         "mike november oscar papa quebec romeo sierra tango uniform victor whiskey "
+         "xray yankee zulu").split()
+# calibrated 2026-08-26 on Qwen3.8 tokenizer: filler ~4.43 tok/item, handler ~108.7 tok
+FILLER_TOK_PER_ITEM = 4.43
+HANDLER_TOK = 108.7
+
+
+def http_json(url, payload=None, timeout=120):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode() if payload else None,
+        headers=_auth({"Content-Type": "application/json"}))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+class Server:
+    def __init__(self, base, model):
+        self.base = base.rstrip("/")
+        self.model = model or http_json(self.base + "/v1/models")["data"][0]["id"]
+
+    def metrics(self):
+        try:
+            req = urllib.request.Request(self.base + "/metrics", headers=_auth({}))
+            txt = urllib.request.urlopen(req, timeout=10).read().decode()
+        except Exception:
+            return None
+        acc = drf = 0.0
+        seen = False
+        for ln in txt.splitlines():
+            if ln.startswith("vllm:spec_decode_num_accepted_tokens_total"):
+                acc += float(ln.rsplit(" ", 1)[1]); seen = True
+            elif ln.startswith("vllm:spec_decode_num_draft_tokens_total"):
+                drf += float(ln.rsplit(" ", 1)[1]); seen = True
+        return (acc, drf) if seen else None
+
+    def block_size(self):
+        try:
+            req = urllib.request.Request(self.base + "/metrics", headers=_auth({}))
+            txt = urllib.request.urlopen(req, timeout=10).read().decode()
+            for ln in txt.splitlines():
+                if ln.startswith("vllm:cache_config_info"):
+                    for part in ln.split(","):
+                        if part.startswith('block_size="'):
+                            return int(part.split('"')[1])
+        except Exception:
+            pass
+        return None
+
+    def run(self, prompt, max_tokens, temperature=0.0, timeout=1800):
+        m0 = self.metrics()
+        payload = {"model": self.model, "prompt": prompt, "max_tokens": max_tokens,
+                   "temperature": temperature, "ignore_eos": True, "stream": True,
+                   "stream_options": {"include_usage": True}}
+        req = urllib.request.Request(self.base + "/v1/completions",
+                                     data=json.dumps(payload).encode(),
+                                     headers=_auth({"Content-Type": "application/json"}))
+        t0 = time.perf_counter()
+        ttft, usage = None, {}
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            for raw in r:
+                line = raw.decode().strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                obj = json.loads(data)
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                if obj.get("choices") and obj["choices"][0].get("text") and ttft is None:
+                    ttft = time.perf_counter() - t0
+        total = time.perf_counter() - t0
+        m1 = self.metrics()
+        ptok = usage.get("prompt_tokens", 0)
+        ctok = usage.get("completion_tokens", 0)
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        decode_t = total - (ttft or 0)
+        acc = None
+        if m0 and m1 and m1[1] > m0[1]:
+            acc = round((m1[0] - m0[0]) / (m1[1] - m0[1]), 4)
+        return {"prompt_tokens": ptok, "completion_tokens": ctok,
+                "cached_tokens": cached, "ttft_s": round(ttft or 0, 3),
+                "prefill_tok_s": round((ptok - (cached or 0)) / ttft, 1)
+                if ttft and ptok - (cached or 0) > 500 else None,
+                "decode_tok_s": round((ctok - 1) / decode_t, 2) if decode_t > 0 and ctok > 1 else None,
+                "total_s": round(total, 2), "acceptance": acc}
+
+
+def filler(n_items, seed):
+    rng = random.Random(seed)
+    return " ".join(rng.choice(WORDS) + str(rng.randint(0, 999)) for _ in range(n_items))
+
+
+def story_prompt(n_items, seed):
+    return ("Here is a log of code words. Read it, then write a long detailed story "
+            "about a space mission, at least 1500 words. Do not stop early.\n\n"
+            + filler(n_items, seed) + "\n\nNow write the story:")
+
+
+def handlers(n, salt=""):
+    return "\n".join(
+        f"def handler_{i}(req, ctx):\n"
+        f"    \"\"\"Handle field_{i}{salt} lookups for tenant {i % 7}.\"\"\"\n"
+        f"    value = req.get('field_{i}')\n"
+        f"    if value is None:\n"
+        f"        ctx.log.warning('missing field_{i}')\n"
+        f"        raise KeyError('field_{i}')\n"
+        f"    result = transform(value, mode='m{i % 13}', scale={i})\n"
+        f"    ctx.metrics.incr('handler_{i}.ok')\n"
+        f"    return result" for i in range(n))
+
+
+def suite_story(srv, a):
+    return [srv.run(story_prompt(80, seed=hash(("story", i, a.salt)) & 0xffff), a.gen,
+                    a.temperature) for i in range(a.runs)]
+
+
+def suite_code(srv, a):
+    p1 = (f"# task {a.salt}\nWrite a complete Python module implementing a thread-safe "
+          "LRU cache class with TTL expiry, type hints, docstrings, and a pytest test "
+          "suite. Output only code.")
+    p2 = ("Here is a Python file:\n```python\n" + handlers(40, a.salt) +
+          "\n```\nRewrite it: keep every handler but add a @retry(3) decorator to each "
+          "and convert the KeyError to a logged warning returning None. Output the full "
+          "rewritten file.")
+    return [srv.run(p1, a.gen, a.temperature), srv.run(p2, a.gen, a.temperature)]
+
+
+def suite_depth(srv, a):
+    n = int(a.depth_tokens / FILLER_TOK_PER_ITEM)
+    return [srv.run(story_prompt(n, seed=hash(("depth", a.salt)) & 0xffff),
+                    min(a.gen, 500), a.temperature)]
+
+
+def suite_codedepth(srv, a):
+    n = int(a.depth_tokens / HANDLER_TOK)
+    p = ("Here is a large Python service file:\n```python\n" + handlers(n, a.salt) +
+         "\n```\nWrite the rewritten versions of handler_0 through handler_5 only, "
+         "adding a @retry(3) decorator and converting KeyError to a logged warning "
+         "returning None.")
+    return [srv.run(p, min(a.gen, 500), a.temperature)]
+
+
+def suite_cache_probe(srv, a):
+    A = ("Reference log: " + filler(3600, seed=hash(("probe", a.salt)) & 0xffff)
+         + "\nQuestion: say OK.")
+    r1 = srv.run(A, 1, 0.0)
+    r2 = srv.run(A + " Then say OK again.", 1, 0.0)
+    bs = srv.block_size()
+    out = {"shared_prefix": r1["prompt_tokens"], "cached_observed": r2["cached_tokens"],
+           "block_size": bs}
+    if bs and r2["cached_tokens"] is not None:
+        best = r1["prompt_tokens"] // bs * bs
+        out["cached_max_possible"] = best
+        out["blocks_dropped"] = (best - r2["cached_tokens"]) // bs
+        out["verdict"] = ("last-block drop ACTIVE (vllm#53670): losing "
+                          f"{best - r2['cached_tokens']} tok/warm-turn"
+                          if r2["cached_tokens"] < best else "no drop — full block hit")
+    return [out]
+
+
+def suite_stress(srv, a):
+    results, errors, lock = [], [], threading.Lock()
+
+    def worker(wid):
+        for k in range(a.runs):
+            p = (f"# stream {wid} round {k} salt {a.salt}\nWrite a complete Python "
+                 f"module implementing data structure #{wid * 100 + k} (pick something "
+                 "non-trivial) with tests. Output only code.")
+            try:
+                r = srv.run(p, 400, a.temperature, timeout=600)
+                with lock: results.append(r)
+            except Exception as e:
+                with lock: errors.append(f"stream{wid}/r{k}: {e}")
+
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=worker, args=(w,)) for w in range(a.concurrency)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    wall = time.perf_counter() - t0
+    toks = sum(r["completion_tokens"] for r in results)
+    try:
+        urllib.request.urlopen(srv.base + "/health", timeout=5)
+        health = "healthy"
+    except Exception:
+        health = "SERVER DOWN — check for SIGSEGV/device-side assert in logs"
+    dec = sorted(r["decode_tok_s"] for r in results if r["decode_tok_s"])
+    return [{"concurrency": a.concurrency, "requests_ok": len(results),
+             "errors": errors, "aggregate_tok_s": round(toks / wall, 1),
+             "per_stream_decode_min_med_max":
+                 [dec[0], dec[len(dec) // 2], dec[-1]] if dec else None,
+             "server_after": health}]
+
+
+SUITES = {"story": suite_story, "code": suite_code, "depth": suite_depth,
+          "codedepth": suite_codedepth, "cache-probe": suite_cache_probe,
+          "stress": suite_stress}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("suites", nargs="+", choices=sorted(SUITES))
+    ap.add_argument("--base", default="http://127.0.0.1:8014")
+    ap.add_argument("--model", default=None, help="default: first id from /v1/models")
+    ap.add_argument("--gen", type=int, default=800, help="max_tokens per generation")
+    ap.add_argument("--depth-tokens", type=int, default=115000)
+    ap.add_argument("--runs", type=int, default=2, help="story repeats / stress rounds")
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--salt", default="v1", help="change to defeat prefix cache on re-runs")
+    ap.add_argument("--concurrency", type=int, default=4, help="stress suite only")
+    ap.add_argument("--no-warmup", action="store_true")
+    ap.add_argument("--json", action="store_true", help="JSONL only, no summary lines")
+    a = ap.parse_args()
+
+    srv = Server(a.base, a.model)
+    if not a.json:
+        print(f"# target {srv.base} model={srv.model} salt={a.salt} temp={a.temperature}",
+              file=sys.stderr)
+    if not a.no_warmup:
+        srv.run(story_prompt(60, seed=1), 200)
+        if not a.json:
+            print("# warmup discarded", file=sys.stderr)
+    for name in a.suites:
+        for r in SUITES[name](srv, a):
+            print(json.dumps({"suite": name, **r}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

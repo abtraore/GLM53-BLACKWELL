@@ -1,0 +1,63 @@
+From bc883e9de35f4f20a8f600be58522551dffdcebd Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Thu, 27 Aug 2026 22:47:13 +0000
+Subject: [PATCH 5/5] kv-cache: scale the n_kv graph-reuse pad with the ubatch
+ size
+
+A 512-token prefill chunk crosses the fixed 256-token n_kv pad boundary
+every chunk, so the graph was rebuilt for every chunk of a long prefill.
+Padding to ~16 ubatches keeps every n_kv-derived shape stable across a
+bucket of chunks: measured graphs reused 0 -> 166/166 prefill chunks on
+GLM-5.3-Flash (86K prompt, 4x RTX 5090). LLAMA_PREFILL_KV_PAD_MULT
+overrides (0 restores 256). Decode ubatches stay on the 256 pad.
+
+Honest ledger: prefill throughput did NOT improve (773-795 vs a 773-935
+cross-boot spread) - per-chunk graph build is milliseconds against a
+~600 ms chunk, so eliminating it is noise at this ubatch size. Kept for
+the reuse property itself (CPU headroom, and it makes ubatch-size sweeps
+cheaper). Profiling instead points at the indexer top-k: one CUB
+DeviceSegmentedSort launch per query row per MLA layer (~5.6K launches
+per 512-token chunk at depth), main thread spinning in pageable-memory
+DtoH copies - the batched radix-select approach (one block per row, one
+launch per layer) is the remaining lever.
+---
+ src/llama-kv-cache.cpp | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index ba91292..4d8a55c 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1237,7 +1237,28 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+ 
+     // pad the n_kv value so that the graph remains constant across batches and can be reused
+     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
+-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
++    //
++    // scale the pad with the ubatch size: a 512-token prefill chunk crosses a
++    // 256-token pad boundary every chunk, so the graph was rebuilt (and the
++    // whole backend-sched pass rerun) for every chunk of a long prefill -
++    // measured as the dominant, single-threaded share of deep-prefill wall
++    // time. padding to ~16 ubatches keeps every n_kv-derived shape stable
++    // across a bucket of consecutive chunks, so graph reuse engages during
++    // prefill too. decode ubatches are small, so decode keeps the 256 pad.
++    // the pad only ever widens the masked region: n_kv stays bounded by the
++    // cache size below, and empty cells are already masked by every fill.
++    // LLAMA_PREFILL_KV_PAD_MULT overrides the multiplier (0 restores 256).
++    static const uint32_t pad_mult = [] {
++        const char * env = getenv("LLAMA_PREFILL_KV_PAD_MULT");
++        return env ? (uint32_t) std::max(0, atoi(env)) : 16u;
++    }();
++
++    uint32_t n_tokens_max = 0;
++    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
++        n_tokens_max = std::max(n_tokens_max, (uint32_t) sinfo.idxs[s].size());
++    }
++
++    const uint32_t n_pad_cur = std::max({n_pad, 256u, pad_mult*n_tokens_max});
+ 
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+         const auto & cells = v_cells[sinfo.strm[s]];
+-- 
+2.53.0
+

@@ -1,0 +1,636 @@
+From 1c66f980dfa07897315da88b6a04f17eb2fd3a6f Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Thu, 27 Aug 2026 21:18:13 +0000
+Subject: [PATCH 3/5] glm5next: fused KDA gate epilogues + ssm_a NOSCAN
+ placement
+
+Two changes found while chasing decode launch overhead (4,484 nodes/token):
+
+1. ggml: add GGML_OP_KDA_GATE (lower_bound * sigmoid(-((x + dt_b) * a)),
+   per-head broadcast) and GGML_OP_KDA_OUT_GATE (rms_norm(x) * w *
+   sigmoid(gate)), CUDA + CPU, replacing 9 elementwise nodes per KDA layer
+   (~300 of 4,484 decode-graph nodes on GLM-5.3-Flash). Wired in glm5next
+   behind cparams.fused_kda_gate with the standard probe and a
+   LLAMA_FUSED_KDA_GATE_DISABLE escape hatch; the unfused chain stays as
+   the fallback. Output is byte-identical fused vs unfused.
+
+2. llama: create glm5next's ssm_a with LLM_TENSOR_SSM_A_NOSCAN, as
+   qwen3next/qwen35 already do. The plain SSM_A placement probe tests
+   GGML_OP_SSM_SCAN, which CUDA rejects for this shape, so all 34 ssm_a
+   tensors silently landed in the CPU buffer ('cannot be used with
+   preferred buffer type CUDA0'): a host->device copy per graph forever,
+   and one scheduler split per KDA layer (11 -> 45 measured) for any
+   fused op consuming the raw weight.
+
+Measured on GLM-5.3-Flash UD-IQ1_S, 4x RTX 5090, 262,144 ctx, greedy:
+spec-off decode 81.2/70.3 -> 83.1/72.8 tok/s (placement fix + fusion);
+with MTP n-max 4 the gains dilute below noise (each graph eval already
+amortizes ~5 tokens): 130-138 shallow / 57.8 at 85K depth, unchanged
+within variance. The placement fix is the transferable part.
+---
+ ggml/include/ggml.h             |  21 ++++++
+ ggml/src/ggml-cpu/ggml-cpu.c    |  10 +++
+ ggml/src/ggml-cpu/ops.cpp       |  78 +++++++++++++++++++++
+ ggml/src/ggml-cpu/ops.h         |   2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu |  11 +++
+ ggml/src/ggml-cuda/kda-gate.cu  | 117 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/kda-gate.cuh |   4 ++
+ ggml/src/ggml.c                 |  76 ++++++++++++++++++++-
+ src/llama-context.cpp           |  26 +++++++
+ src/llama-cparams.h             |   2 +
+ src/llama-graph.h               |   1 +
+ src/models/glm5next.cpp         |  33 ++++++---
+ 12 files changed, 371 insertions(+), 10 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/kda-gate.cu
+ create mode 100644 ggml/src/ggml-cuda/kda-gate.cuh
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 5f6774a..2f43274 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -574,6 +574,8 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_KDA_GATE,
++        GGML_OP_KDA_OUT_GATE,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2597,6 +2599,25 @@ extern "C" {
+             struct ggml_tensor  * state,
+             int64_t               K);
+ 
++    // KDA forget-gate epilogue, fusing the elementwise tail after the low-rank gate
++    // projection: lower_bound * sigmoid(-((x + dt_bias) * a)), with `a` broadcast
++    // per head (rows of x are n_head consecutive blocks of head_dim channels)
++    GGML_API struct ggml_tensor * ggml_kda_gate(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,       // [d_inner, n_tokens]
++            struct ggml_tensor  * dt_b,    // [d_inner]
++            struct ggml_tensor  * a,       // [n_head]
++            float                 lower_bound);
++
++    // KDA output epilogue: rms_norm over ne0 with a weight shared by every head,
++    // times a plain sigmoid gate: rms_norm(x, eps) * w * sigmoid(gate)
++    GGML_API struct ggml_tensor * ggml_kda_out_gate(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,       // [head_dim, n_head, n_tokens]
++            struct ggml_tensor  * w,       // [head_dim]
++            struct ggml_tensor  * gate,    // [head_dim, n_head, n_tokens]
++            float                 eps);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 87ac0a7..11971c5 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2076,6 +2076,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_KDA_GATE:
++            {
++                ggml_compute_forward_kda_gate(params, tensor);
++            } break;
++        case GGML_OP_KDA_OUT_GATE:
++            {
++                ggml_compute_forward_kda_out_gate(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2259,6 +2267,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_KDA_GATE:
++        case GGML_OP_KDA_OUT_GATE:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index b869f4b..7f22764 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11246,6 +11246,84 @@ void ggml_compute_forward_dsv4_hc_post(
+     }
+ }
+ 
++// ggml_compute_forward_kda_gate
++// dst = lower_bound * sigmoid(-((x + dt_b) * a)), a broadcast per head_dim block
++
++void ggml_compute_forward_kda_gate(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * dt_b = dst->src[1];
++    const ggml_tensor * a    = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(dst));
++
++    const int64_t d_inner  = x->ne[0];
++    const int64_t n_head   = ggml_nelements(a);
++    const int64_t head_dim = d_inner/n_head;
++    const int64_t n_rows   = ggml_nrows(x);
++
++    float lower_bound;
++    memcpy(&lower_bound, dst->op_params, sizeof(float));
++
++    const float * xd = (const float *) x->data;
++    const float * bd = (const float *) dt_b->data;
++    const float * ad = (const float *) a->data;
++          float * dd = (float *) dst->data;
++
++    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
++        const float * xr = xd + r*d_inner;
++              float * dr = dd + r*d_inner;
++        for (int64_t i = 0; i < d_inner; ++i) {
++            const float v = (xr[i] + bd[i]) * ad[i/head_dim];
++            dr[i] = lower_bound / (1.0f + expf(v));
++        }
++    }
++}
++
++// ggml_compute_forward_kda_out_gate
++// dst = rms_norm(x, eps over ne0) * w * sigmoid(gate)
++
++void ggml_compute_forward_kda_out_gate(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * w    = dst->src[1];
++    const ggml_tensor * gate = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(gate) && ggml_is_contiguous(dst));
++
++    const int64_t head_dim = x->ne[0];
++    const int64_t n_rows   = ggml_nelements(x)/head_dim;
++
++    float eps;
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    const float * xd = (const float *) x->data;
++    const float * wd = (const float *) w->data;
++    const float * gd = (const float *) gate->data;
++          float * dd = (float *) dst->data;
++
++    for (int64_t r = params->ith; r < n_rows; r += params->nth) {
++        const float * xr = xd + r*head_dim;
++        const float * gr = gd + r*head_dim;
++              float * dr = dd + r*head_dim;
++
++        float sumsq = 0.0f;
++        for (int64_t c = 0; c < head_dim; ++c) {
++            sumsq += xr[c]*xr[c];
++        }
++        const float rrms = 1.0f/sqrtf(sumsq/head_dim + eps);
++
++        for (int64_t c = 0; c < head_dim; ++c) {
++            const float sig = 1.0f/(1.0f + expf(-gr[c]));
++            dr[c] = xr[c]*rrms * wd[c] * sig;
++        }
++    }
++}
++
+ // ggml_compute_forward_rwkv_wkv7
+ 
+ static void ggml_compute_forward_rwkv_wkv7_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 4c1642a..4851675 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -109,6 +109,8 @@ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * p
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_kda_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_kda_out_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2456f7d..cb96849 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -22,6 +22,7 @@
+ #include "ggml-cuda/cpy.cuh"
+ #include "ggml-cuda/cross-entropy-loss.cuh"
+ #include "ggml-cuda/cumsum.cuh"
++#include "ggml-cuda/kda-gate.cuh"
+ #include "ggml-cuda/diagmask.cuh"
+ #include "ggml-cuda/diag.cuh"
+ #include "ggml-cuda/fattn.cuh"
+@@ -2381,6 +2382,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_DSV4_HC_POST:
+             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+             break;
++        case GGML_OP_KDA_GATE:
++            ggml_cuda_op_kda_gate(ctx, dst);
++            break;
++        case GGML_OP_KDA_OUT_GATE:
++            ggml_cuda_op_kda_out_gate(ctx, dst);
++            break;
+         case GGML_OP_RWKV_WKV7:
+             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+             break;
+@@ -5297,6 +5304,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_KDA_GATE:
++        case GGML_OP_KDA_OUT_GATE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT:
+             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+         case GGML_OP_CROSS_ENTROPY_LOSS:
+diff --git a/ggml/src/ggml-cuda/kda-gate.cu b/ggml/src/ggml-cuda/kda-gate.cu
+new file mode 100644
+index 0000000..ba1ad47
+--- /dev/null
++++ b/ggml/src/ggml-cuda/kda-gate.cu
+@@ -0,0 +1,117 @@
++#include "kda-gate.cuh"
++
++// KDA forget-gate epilogue: dst = lower_bound * sigmoid(-((x + dt_b) * a))
++//                               = lower_bound / (1 + expf((x + dt_b) * a))
++// x [d_inner, n_tokens], dt_b [d_inner], a [n_head] broadcast per head_dim block.
++// Replaces the ADD -> MUL -> SCALE -> SIGMOID -> SCALE chain the unfused graph
++// builds per KDA layer.
++static __global__ void kda_gate_f32(
++        const float * __restrict__ x,
++        const float * __restrict__ dt_b,
++        const float * __restrict__ a,
++              float * __restrict__ dst,
++        const int64_t n,
++        const int     d_inner,
++        const int     head_dim,
++        const float   lower_bound) {
++    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++
++    const int i0 = (int) (i % d_inner);
++
++    const float v = (x[i] + dt_b[i0]) * a[i0/head_dim];
++
++    dst[i] = lower_bound / (1.0f + expf(v));
++}
++
++void ggml_cuda_op_kda_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * dt_b = dst->src[1];
++    const ggml_tensor * a    = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x));
++
++    const int64_t n       = ggml_nelements(dst);
++    const int     d_inner = (int) x->ne[0];
++    const int     n_head  = (int) a->ne[0];
++
++    float lower_bound;
++    memcpy(&lower_bound, dst->op_params, sizeof(float));
++
++    const int block = 256;
++    const int64_t grid = (n + block - 1)/block;
++
++    kda_gate_f32<<<grid, block, 0, ctx.stream()>>>(
++            (const float *) x->data, (const float *) dt_b->data, (const float *) a->data,
++            (float *) dst->data, n, d_inner, d_inner/n_head, lower_bound);
++}
++
++// KDA output epilogue: dst = rms_norm(x, eps) * w * sigmoid(gate)
++// x/gate [head_dim, n_head, n_tokens], w [head_dim]; the RMS reduction runs over
++// ne0 (head_dim) only, one weight vector shared by every head. Replaces the
++// RMS_NORM -> MUL(w) -> SIGMOID -> MUL chain per KDA layer.
++static __global__ void kda_out_gate_f32(
++        const float * __restrict__ x,
++        const float * __restrict__ w,
++        const float * __restrict__ gate,
++              float * __restrict__ dst,
++        const int   head_dim,
++        const float eps) {
++    const int64_t row = blockIdx.x;           // one block per (head, token) row
++    const float * xr = x    + row*head_dim;
++    const float * gr = gate + row*head_dim;
++          float * dr = dst  + row*head_dim;
++
++    float sumsq = 0.0f;
++    for (int c = threadIdx.x; c < head_dim; c += blockDim.x) {
++        const float v = xr[c];
++        sumsq += v*v;
++    }
++    sumsq = warp_reduce_sum(sumsq);
++
++    __shared__ float s_warp[32];
++    const int warp = threadIdx.x/WARP_SIZE;
++    const int lane = threadIdx.x%WARP_SIZE;
++    if (lane == 0) {
++        s_warp[warp] = sumsq;
++    }
++    __syncthreads();
++    if (warp == 0) {
++        sumsq = lane < blockDim.x/WARP_SIZE ? s_warp[lane] : 0.0f;
++        sumsq = warp_reduce_sum(sumsq);
++        if (lane == 0) {
++            s_warp[0] = rsqrtf(sumsq/head_dim + eps);
++        }
++    }
++    __syncthreads();
++    const float rrms = s_warp[0];
++
++    for (int c = threadIdx.x; c < head_dim; c += blockDim.x) {
++        const float sig = 1.0f/(1.0f + expf(-gr[c]));
++        dr[c] = xr[c]*rrms * w[c] * sig;
++    }
++}
++
++void ggml_cuda_op_kda_out_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x    = dst->src[0];
++    const ggml_tensor * w    = dst->src[1];
++    const ggml_tensor * gate = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(gate));
++
++    const int     head_dim = (int) x->ne[0];
++    const int64_t n_rows   = ggml_nelements(x)/head_dim;
++
++    float eps;
++    memcpy(&eps, dst->op_params, sizeof(float));
++
++    const int block = head_dim <= 128 ? 128 : 256;
++
++    kda_out_gate_f32<<<n_rows, block, 0, ctx.stream()>>>(
++            (const float *) x->data, (const float *) w->data, (const float *) gate->data,
++            (float *) dst->data, head_dim, eps);
++}
+diff --git a/ggml/src/ggml-cuda/kda-gate.cuh b/ggml/src/ggml-cuda/kda-gate.cuh
+new file mode 100644
+index 0000000..1e36670
+--- /dev/null
++++ b/ggml/src/ggml-cuda/kda-gate.cuh
+@@ -0,0 +1,4 @@
++#include "common.cuh"
++
++void ggml_cuda_op_kda_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_kda_out_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e0b615c..3d453c2 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1083,6 +1083,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "KDA_GATE",
++    "KDA_OUT_GATE",
+ 
+     "UNARY",
+ 
+@@ -1100,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1198,6 +1200,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "kda_gate(x, dt_b, a)",
++    "kda_out_gate(x, w, gate)",
+ 
+     "unary(x)",
+ 
+@@ -1215,7 +1219,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6508,6 +6512,74 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// ggml_kda_gate
++
++struct ggml_tensor * ggml_kda_gate(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * dt_b,
++        struct ggml_tensor  * a,
++        float                 lower_bound) {
++    GGML_ASSERT(x->type    == GGML_TYPE_F32);
++    GGML_ASSERT(dt_b->type == GGML_TYPE_F32);
++    GGML_ASSERT(a->type    == GGML_TYPE_F32);
++
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(dt_b));
++    GGML_ASSERT(ggml_is_contiguous(a));
++
++    const int64_t d_inner = x->ne[0];
++    const int64_t n_head  = a->ne[0];
++
++    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
++    GGML_ASSERT(dt_b->ne[0] == d_inner && ggml_nelements(dt_b) == d_inner);
++    GGML_ASSERT(ggml_nelements(a) == n_head);
++    GGML_ASSERT(n_head > 0 && d_inner % n_head == 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, x->ne[1]);
++
++    ggml_set_op_params_f32(result, 0, lower_bound);
++
++    result->op     = GGML_OP_KDA_GATE;
++    result->src[0] = x;
++    result->src[1] = dt_b;
++    result->src[2] = a;
++
++    return result;
++}
++
++// ggml_kda_out_gate
++
++struct ggml_tensor * ggml_kda_out_gate(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * gate,
++        float                 eps) {
++    GGML_ASSERT(x->type    == GGML_TYPE_F32);
++    GGML_ASSERT(w->type    == GGML_TYPE_F32);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32);
++
++    GGML_ASSERT(ggml_is_contiguous(x));
++    GGML_ASSERT(ggml_is_contiguous(w));
++    GGML_ASSERT(ggml_is_contiguous(gate));
++
++    GGML_ASSERT(x->ne[3] == 1);
++    GGML_ASSERT(ggml_nelements(w) == x->ne[0]);
++    GGML_ASSERT(ggml_are_same_shape(gate, x));
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2]);
++
++    ggml_set_op_params_f32(result, 0, eps);
++
++    result->op     = GGML_OP_KDA_OUT_GATE;
++    result->src[0] = x;
++    result->src[1] = w;
++    result->src[2] = gate;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6ed803b..ecc628e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -56,6 +56,12 @@ static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
+     /*.n_tokens_per_seq =*/ 16,
+ };
+ 
++static const llm_fused_op_probe llm_fused_op_kda_gate_probe = {
++    /*.op               =*/ LLM_FUSED_OP_KDA_GATE,
++    /*.name             =*/ "fused KDA gate epilogues",
++    /*.n_tokens_per_seq =*/ 1,
++};
++
+ static const llm_fused_op_probe llm_fused_op_lid_probe = {
+     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
+     /*.name             =*/ "Lightning Indexer",
+@@ -236,6 +242,20 @@ llama_context::llama_context(
+     cparams.fused_lid    = true;
+     cparams.auto_flid    = true;
+ 
++    cparams.fused_kda_gate = true;
++    cparams.auto_fkg       = true;
++
++    {
++        // escape hatch for A/B and for numerics debugging; the fused epilogues
++        // compute the same math with the same per-element order, but keep the
++        // hatch symmetric with the other fused ops
++        const char * LLAMA_FUSED_KDA_GATE_DISABLE = getenv("LLAMA_FUSED_KDA_GATE_DISABLE");
++        if (LLAMA_FUSED_KDA_GATE_DISABLE && atoi(LLAMA_FUSED_KDA_GATE_DISABLE) != 0) {
++            cparams.fused_kda_gate = false;
++            cparams.auto_fkg       = false;
++        }
++    }
++
+     {
+         // escape hatch: the fused kernel sums the heads in a different order than the
+         // unfused graph, so a near-tied indexer top-k can come out different
+@@ -579,6 +599,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+         cparams.auto_flid = false;
+     }
+ 
++    if (cparams.auto_fkg) {
++        LLAMA_LOG_INFO("%s: resolving fused KDA gate support:\n", func);
++        resolve(llm_fused_op_kda_gate_probe, cparams.fused_kda_gate);
++        cparams.auto_fkg = false;
++    }
++
+     if (cparams.auto_fhc) {
+         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 574ce95..2d817de 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -44,6 +44,8 @@ struct llama_cparams {
+     bool auto_fgdn;
+     bool fused_lid;          // use fused lightning indexer
+     bool auto_flid;
++    bool fused_kda_gate;     // use the fused KDA gate + output-gate epilogues
++    bool auto_fkg;
+     bool fused_dsv4_hc_pre;
+     bool fused_dsv4_hc_comb;
+     bool fused_dsv4_hc_post;
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index c994a17..e2a7aae 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -52,6 +52,7 @@ enum llm_fused_op {
+     LLM_FUSED_OP_DSV4_HC_PRE,
+     LLM_FUSED_OP_DSV4_HC_COMB,
+     LLM_FUSED_OP_DSV4_HC_POST,
++    LLM_FUSED_OP_KDA_GATE,
+ };
+ 
+ enum llm_ffn_op_type : int {
+diff --git a/src/models/glm5next.cpp b/src/models/glm5next.cpp
+index adf38c3..eb96b93 100644
+--- a/src/models/glm5next.cpp
++++ b/src/models/glm5next.cpp
+@@ -211,7 +211,12 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
+             layer.ssm_g_b = create_tensor(tn(LLM_TENSOR_SSM_G_B, "weight", il), {head_dim, d_inner}, flags);
+ 
+             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), {n_embd, n_head}, flags);
+-            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A,              il), {n_head}, flags);
++            // NOSCAN: the placement probe tests GGML_OP_MUL instead of SSM_SCAN, which
++            // CUDA rejects for this shape — plain SSM_A left all 34 ssm_a tensors on
++            // the CPU buffer ("cannot be used with preferred buffer type"), costing a
++            // host->device copy per graph and, for any fused op consuming the raw
++            // weight, one scheduler split per KDA layer (11 -> 45 splits measured)
++            layer.ssm_a    = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,       il), {n_head}, flags);
+             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT,   "bias",   il), {d_inner}, flags);
+ 
+             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", il), {head_dim}, flags);
+@@ -340,11 +345,17 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
+     //   g = lower_bound * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))
+     // ssm_a holds -exp(A_log), so exp(A_log) * y == -(y * ssm_a)
+     ggml_tensor * g = ggml_mul_mat(ctx0, layer.ssm_f_b, ggml_mul_mat(ctx0, layer.ssm_f_a, inp));
+-    g = ggml_add(ctx0, g, layer.ssm_dt_b);
+-    g = ggml_reshape_3d(ctx0, g, head_dim, n_head, n_tokens);
+-    g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
+-    g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
+-    g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
++    if (cparams.fused_kda_gate) {
++        // one kernel for the whole epilogue; same math, same per-element order
++        g = ggml_kda_gate(ctx0, g, layer.ssm_dt_b, layer.ssm_a, hparams.kda_gate_lower_bound);
++        res->add_fused_node({LLM_FUSED_OP_KDA_GATE, g, il});
++    } else {
++        g = ggml_add(ctx0, g, layer.ssm_dt_b);
++        g = ggml_reshape_3d(ctx0, g, head_dim, n_head, n_tokens);
++        g = ggml_mul(ctx0, g, ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1));
++        g = ggml_sigmoid(ctx0, ggml_scale(ctx0, g, -1.0f));
++        g = ggml_scale(ctx0, g, hparams.kda_gate_lower_bound);
++    }
+     g = ggml_reshape_4d(ctx0, g, head_dim, n_head, n_seq_tokens, n_seqs);
+     cb(g, "kda_gate", il);
+ 
+@@ -369,8 +380,14 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
+ 
+     // RMS over head_dim only, one weight shared by every head, then a plain sigmoid
+     // gate: not the SiLU that FusedRMSNormGated defaults to
+-    ggml_tensor * normed = build_norm(o, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
+-    ggml_tensor * gated  = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
++    ggml_tensor * gated;
++    if (cparams.fused_kda_gate) {
++        gated = ggml_kda_out_gate(ctx0, o, layer.ssm_o_norm, gate, hparams.f_norm_rms_eps);
++        res->add_fused_node({LLM_FUSED_OP_KDA_GATE, gated, il});
++    } else {
++        ggml_tensor * normed = build_norm(o, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
++        gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, gate));
++    }
+     cb(gated, "kda_normed", il);
+ 
+     cur = ggml_mul_mat(ctx0, layer.wo, ggml_cont_2d(ctx0, gated, d_inner, n_tokens));
+-- 
+2.53.0
+

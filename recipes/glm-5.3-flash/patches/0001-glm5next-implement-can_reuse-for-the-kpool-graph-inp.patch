@@ -1,0 +1,108 @@
+From cfa9516cfb6e5426ca430476632e90eb2d3b2c3e Mon Sep 17 00:00:00 2001
+From: abtraore <abdrahtraore97@gmail.com>
+Date: Thu, 27 Aug 2026 19:56:34 +0000
+Subject: [PATCH 1/5] glm5next: implement can_reuse for the kpool graph input
+
+llm_graph_input_kpool inherited the base can_reuse (return false), so every
+glm5next decode step rebuilt the full graph: 'graphs reused = 0' on every
+generation. Implement the override following the attn/mem_hybrid pattern:
+rebind both cache contexts, then require every stored tensor shape to match
+what a fresh build with the new params would produce (same n_pools/n_tps/
+n_stream arithmetic as build_inp_kpool; the scoring split depends only on
+cparams.n_ctx, which cannot change within a context).
+
+Measured on GLM-5.3-Flash UD-IQ1_S, 4x RTX 5090 (sm120, layer split),
+262,144 ctx: graphs reused 0 -> 298/300; single-stream decode 59 -> 81 tok/s
+shallow, 17.7 -> 19.7 tok/s at 84.5K depth; greedy output byte-identical
+before/after.
+---
+ src/llama-kv-cache-kpool.cpp | 56 ++++++++++++++++++++++++++++++++++++
+ src/llama-kv-cache-kpool.h   |  2 ++
+ 2 files changed, 58 insertions(+)
+
+diff --git a/src/llama-kv-cache-kpool.cpp b/src/llama-kv-cache-kpool.cpp
+index 9f214dd..fc5c0d4 100644
+--- a/src/llama-kv-cache-kpool.cpp
++++ b/src/llama-kv-cache-kpool.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-kv-cache-kpool.h"
+ 
++#include "llama-memory-hybrid.h"
++
+ #include "llama-batch.h"
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cells.h"
+@@ -439,3 +441,57 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
+             /* cell_pool */ nullptr, pool_cells, /* bias */ nullptr, pool_bias,
+             sel_mask, cand_mask, ubatch, kpool);
+ }
++
++bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
++    // rebind before any check: set_input reads these every step, so a reused
++    // graph must see the current contexts, exactly like the attn/hybrid inputs
++    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(params.mctx);
++
++    mctx_attn = mctx_hyb->get_attn();
++    mctx_idx  = mctx_hyb->get_idx();
++
++    if (mctx_attn == nullptr || mctx_idx == nullptr) {
++        return false;
++    }
++
++    bool res = true;
++
++    res &= k_idxs->ne[0] == params.ubatch.n_tokens;
++
++    // the scoring inputs exist iff cparams.n_ctx > n_select, which cannot change
++    // within a context's lifetime, so a non-scoring graph stays valid as long as
++    // k_idxs holds
++    if (pool_cells == nullptr) {
++        return res;
++    }
++
++    const int64_t n_kv     = mctx_attn->get_n_kv();
++    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
++    const int64_t n_tps    = params.ubatch.n_tokens/n_stream;
++    const int64_t n_ps     = (int64_t) params.ubatch.n_seqs_unq/n_stream;
++
++    // build_inp_kpool asserts this shape invariant; here it is a reuse refusal,
++    // not a crash, since a fresh build may batch the sequences differently
++    if (n_ps < 1 || (int64_t) params.ubatch.n_seqs_unq != n_ps*n_stream) {
++        return false;
++    }
++
++    const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
++
++    res &= pool_cells->ne[0] == (int64_t) kpool*n_pools;
++    res &= pool_cells->ne[1] == n_stream;
++
++    res &= pool_bias->ne[0] == n_pools;
++    res &= pool_bias->ne[1] == n_tps;
++    res &= pool_bias->ne[2] == n_stream;
++
++    res &= sel_mask->ne[0]  == n_kv;
++    res &= sel_mask->ne[1]  == n_tps;
++    res &= sel_mask->ne[3]  == n_stream;
++
++    res &= cand_mask->ne[0] == n_kv;
++    res &= cand_mask->ne[1] == n_tps;
++    res &= cand_mask->ne[3] == n_stream;
++
++    return res;
++}
+diff --git a/src/llama-kv-cache-kpool.h b/src/llama-kv-cache-kpool.h
+index 2ad259c..a6780b2 100644
+--- a/src/llama-kv-cache-kpool.h
++++ b/src/llama-kv-cache-kpool.h
+@@ -188,6 +188,8 @@ public:
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+ 
++    bool can_reuse(const llm_graph_params & params) override;
++
+     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
+     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
+     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]
+-- 
+2.53.0
+
